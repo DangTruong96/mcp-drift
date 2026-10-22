@@ -206,5 +206,124 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
 
 
+class TestVerify(unittest.TestCase):
+    """verify_lockfile: the lockfile's stored hashes must recompute."""
+
+    TOOLS = [
+        {"name": "a", "description": "one",
+         "inputSchema": {"type": "object"},
+         "annotations": {"title": "A"}},
+        {"name": "b", "description": "two", "inputSchema": {}},
+    ]
+
+    def snap(self):
+        return md.build_snapshot({"transport": "test"},
+                                 tools=json.loads(json.dumps(self.TOOLS)))
+
+    def test_intact_snapshot_passes(self):
+        self.assertEqual(md.verify_lockfile(self.snap()), [])
+
+    def test_roundtripped_snapshot_passes(self):
+        # What verify actually sees in production: JSON out and back in.
+        snap = json.loads(json.dumps(self.snap()))
+        self.assertEqual(md.verify_lockfile(snap), [])
+
+    def test_tampered_definition_flagged(self):
+        snap = self.snap()
+        snap["tools"][0]["definition"]["description"] = "one (edited)"
+        problems = md.verify_lockfile(snap)
+        self.assertTrue(any("entry fingerprint" in p for p in problems))
+        self.assertTrue(any("top-level" in p for p in problems))
+
+    def test_tampered_field_hash_flagged(self):
+        snap = self.snap()
+        snap["tools"][0]["fields"]["description"] = "0" * 64
+        problems = md.verify_lockfile(snap)
+        self.assertTrue(any("field hash mismatch" in p for p in problems))
+
+    def test_tampered_entry_fingerprint_flagged(self):
+        snap = self.snap()
+        snap["tools"][1]["fingerprint"] = "0" * 64
+        problems = md.verify_lockfile(snap)
+        self.assertTrue(any("entry fingerprint" in p for p in problems))
+
+    def test_tampered_top_level_flagged(self):
+        snap = self.snap()
+        snap["fingerprint"] = "0" * 64
+        problems = md.verify_lockfile(snap)
+        self.assertTrue(any("top-level" in p for p in problems))
+
+    def test_missing_field_hash_flagged(self):
+        snap = self.snap()
+        del snap["tools"][0]["fields"]["annotations"]
+        problems = md.verify_lockfile(snap)
+        self.assertTrue(any("no field hash stored" in p for p in problems))
+
+    def test_field_hash_for_absent_field_flagged(self):
+        snap = self.snap()
+        snap["tools"][1]["fields"]["title"] = md.fingerprint("ghost")
+        problems = md.verify_lockfile(snap)
+        self.assertTrue(any("absent from the definition" in p
+                            for p in problems))
+
+    def test_duplicate_names_flagged(self):
+        snap = self.snap()
+        snap["tools"].append(dict(snap["tools"][0]))
+        problems = md.verify_lockfile(snap)
+        self.assertTrue(any("duplicate entry" in p for p in problems))
+
+
+class TestVerifyCommand(unittest.TestCase):
+    """CLI-level: verify exit codes on tools-file and live snapshots."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.lock = os.path.join(self.td.name, "lock.json")
+        self.dump = os.path.join(self.td.name, "tools.json")
+        with open(self.dump, "w") as fh:
+            json.dump({"tools": [
+                {"name": "a", "description": "one", "inputSchema": {}}
+            ]}, fh)
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def test_verify_clean_lockfile_exit_0(self):
+        r = run_cli(["snapshot", "--tools-file", self.dump,
+                     "-o", self.lock])
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        r = run_cli(["verify", "--lock", self.lock])
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn("Lockfile OK", r.stdout)
+
+    def test_verify_tampered_lockfile_exit_1(self):
+        r = run_cli(["snapshot", "--tools-file", self.dump,
+                     "-o", self.lock])
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        with open(self.lock, encoding="utf-8") as fh:
+            snap = json.load(fh)
+        snap["tools"][0]["definition"]["description"] = "one (edited)"
+        with open(self.lock, "w", encoding="utf-8") as fh:
+            json.dump(snap, fh)
+        r = run_cli(["verify", "--lock", self.lock])
+        self.assertEqual(r.returncode, 1, r.stderr + r.stdout)
+        self.assertIn("FAILED verification", r.stdout)
+        r = run_cli(["verify", "--lock", self.lock, "--json"])
+        self.assertEqual(r.returncode, 1, r.stderr + r.stdout)
+        self.assertFalse(json.loads(r.stdout)["ok"])
+
+    def test_verify_missing_lockfile_exit_2(self):
+        r = run_cli(["verify", "--lock", self.lock])
+        self.assertEqual(r.returncode, 2, r.stderr + r.stdout)
+
+    def test_verify_live_snapshot_exit_0(self):
+        server = [sys.executable, FAKE]
+        r = run_cli(["snapshot", "-o", self.lock, "--"] + server)
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        r = run_cli(["verify", "--lock", self.lock])
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn("2 tools", r.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

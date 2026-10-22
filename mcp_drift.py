@@ -28,7 +28,7 @@ import sys
 import threading
 from datetime import datetime, timezone
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 LOCK_FORMAT = "mcp-drift-lock"
 DEFAULT_LOCK = "mcp-drift.lock.json"
@@ -409,9 +409,18 @@ def build_snapshot(source, probe=None, tools=None, resources=None,
         if items is not None:
             m = entries_by_name(items)
             snap[label] = [m[n] for n in sorted(m)]
-    core = {k: snap[k] for k in snap if k not in ("created_at", "tool")}
-    snap["fingerprint"] = fingerprint(core)
+    snap["fingerprint"] = _snapshot_fingerprint(snap)
     return snap
+
+
+def _snapshot_fingerprint(snap):
+    """Top-level fingerprint of a snapshot document: everything except
+    the volatile `created_at`/`tool` fields and the fingerprint itself.
+    Shared by snapshot building and `verify_lockfile` so the two can
+    never drift apart."""
+    core = {k: snap[k] for k in snap
+            if k not in ("created_at", "tool", "fingerprint")}
+    return fingerprint(core)
 
 
 def snapshot_from_probe(command, args, env, env_keys, name, timeout,
@@ -432,6 +441,9 @@ def snapshot_from_probe(command, args, env, env_keys, name, timeout,
         prompts=probe["prompts"], server_info=probe["serverInfo"],
         observations=probe["observations"])
     snap["server"]["negotiated_protocol"] = probe["negotiated_protocol"]
+    # Added after build_snapshot ran: refresh the top-level fingerprint
+    # so the stored document still hashes to it (verify_lockfile checks).
+    snap["fingerprint"] = _snapshot_fingerprint(snap)
     return snap
 
 
@@ -560,6 +572,75 @@ def render_diff(diff, old_label="lockfile", new_label="current"):
 
 
 # --------------------------------------------------------------------------
+# Lockfile verification (integrity of the stored document itself)
+# --------------------------------------------------------------------------
+
+def verify_lockfile(snap):
+    """Recompute every fingerprint stored in a lockfile from its stored
+    definitions. Returns a list of problems; [] means intact.
+
+    `check` and `diff` trust the stored fingerprints when comparing —
+    they have to, the fingerprints are the baseline. That makes the
+    lockfile itself a security artifact: a hand edit, a bad merge or
+    a truncated copy would otherwise become the baseline silently.
+    This catches all of those by recomputing the top-level
+    fingerprint, every entry fingerprint and every per-field hash
+    from the definitions actually stored next to them.
+
+    Limit, stated plainly: a lockfile whose fingerprints were *all*
+    recomputed after editing is indistinguishable from a fresh
+    snapshot. Catching that is what reviewing lockfile changes in
+    pull requests is for — the same division of labour as
+    package-lock.json.
+    """
+    problems = []
+    stored_top = snap.get("fingerprint")
+    if stored_top is None:
+        problems.append("lockfile has no top-level fingerprint")
+    else:
+        if _snapshot_fingerprint(snap) != stored_top:
+            problems.append(
+                "top-level fingerprint mismatch: the stored document "
+                "does not hash to its own fingerprint (edited or "
+                "corrupted after snapshotting)")
+    for section in ("tools", "resources", "prompts"):
+        entries = snap.get(section)
+        if entries is None:
+            continue
+        seen = set()
+        for entry in entries:
+            name = entry.get("name", "?")
+            label = "%s %r" % (section[:-1], name)
+            if name in seen:
+                problems.append("%s: duplicate entry in the lockfile"
+                                % label)
+            seen.add(name)
+            definition = entry.get("definition")
+            if not isinstance(definition, dict):
+                problems.append("%s: missing stored definition" % label)
+                continue
+            if entry.get("fingerprint") != fingerprint(definition):
+                problems.append(
+                    "%s: entry fingerprint does not match its stored "
+                    "definition" % label)
+            stored_fields = entry.get("fields") or {}
+            for field, stored_hash in stored_fields.items():
+                if field not in definition:
+                    problems.append(
+                        "%s: field hash stored for %r, which is absent "
+                        "from the definition" % (label, field))
+                elif fingerprint(definition[field]) != stored_hash:
+                    problems.append(
+                        "%s: field hash mismatch for %r" % (label, field))
+            for field in TOOL_FIELDS:
+                if field in definition and field not in stored_fields:
+                    problems.append(
+                        "%s: no field hash stored for %r (present in "
+                        "the definition)" % (label, field))
+    return problems
+
+
+# --------------------------------------------------------------------------
 # Source resolution from CLI args
 # --------------------------------------------------------------------------
 
@@ -647,6 +728,27 @@ def cmd_diff(args):
     return 1 if diff["drift"] else 0
 
 
+def cmd_verify(args):
+    snap = load_snapshot(args.lock)
+    problems = verify_lockfile(snap)
+    if args.json:
+        print(json.dumps({"lock": args.lock, "ok": not problems,
+                          "problems": problems},
+                         indent=2, ensure_ascii=False))
+    elif problems:
+        print("Lockfile FAILED verification (%s):" % args.lock)
+        for problem in problems:
+            print("  - %s" % problem)
+    else:
+        counts = ", ".join(
+            "%d %s" % (len(snap[s]), s)
+            for s in ("tools", "resources", "prompts") if snap.get(s))
+        print("Lockfile OK: %s — every stored fingerprint recomputes "
+              "from the stored definitions (%s)."
+              % (args.lock, counts or "no entries"))
+    return 1 if problems else 0
+
+
 def cmd_show(args):
     snap = load_snapshot(args.lock)
     if args.json:
@@ -725,6 +827,14 @@ def build_parser():
     sp.add_argument("--lock", default=DEFAULT_LOCK)
     sp.add_argument("--json", action="store_true", help="raw JSON")
     sp.set_defaults(func=cmd_show)
+
+    sp = sub.add_parser("verify", help="recompute a lockfile's stored "
+                        "fingerprints from its stored definitions; "
+                        "exit 1 if anything was edited or corrupted")
+    sp.add_argument("--lock", default=DEFAULT_LOCK,
+                    help="lockfile path (default %s)" % DEFAULT_LOCK)
+    sp.add_argument("--json", action="store_true", help="JSON output")
+    sp.set_defaults(func=cmd_verify)
     return parser
 
 

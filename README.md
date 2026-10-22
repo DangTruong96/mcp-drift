@@ -52,6 +52,10 @@ the model or the approval UI — does not trip them.
 - **Server identity, not server name** — baselines are keyed by a
   fingerprint of the launch descriptor (command + args + env **keys**;
   env values are never stored), because a name can be spoofed.
+- **Lockfile self-verification** — `mcp-drift verify` recomputes every
+  stored fingerprint (top-level, per-entry, per-field) from the stored
+  definitions, so a hand-edited, merge-damaged or truncated lockfile
+  is caught before `check` trusts it as the baseline.
 - **Protocol honesty observations** — each snapshot records the
   negotiated protocol version, flags silent downgrades, runs a
   bogus-version **echo test** (researchers found public servers that
@@ -66,7 +70,7 @@ the model or the approval UI — does not trip them.
 Drift detection sees *definition* changes. A server that keeps its
 manifest byte-identical but changes its behaviour server-side is
 invisible to pinning — run a description scanner and runtime monitoring
-too. MCPDrift also probes **stdio** servers live in v0.1.0; remote (HTTP)
+too. MCPDrift also probes **stdio** servers live; remote (HTTP)
 servers are supported through the offline `--tools-file` mode, with
 native HTTP probing on the roadmap.
 
@@ -125,6 +129,23 @@ by re-running `snapshot` and committing the new lockfile in the same PR.
 $ mcp-drift show                       # what's in the lockfile?
 $ mcp-drift diff old.lock.json new.lock.json   # compare two snapshots offline
 $ mcp-drift check --json               # machine-readable verdict
+$ mcp-drift verify                     # is the lockfile itself intact?
+```
+
+`verify` is the offline integrity check for the baseline itself — it
+recomputes every stored fingerprint from the stored definitions:
+
+```console
+$ mcp-drift verify
+Lockfile OK: mcp-drift.lock.json — every stored fingerprint recomputes from the stored definitions (2 tools, 1 resources).
+
+$ # …after one description is quietly edited inside the lockfile:
+$ mcp-drift verify
+Lockfile FAILED verification (mcp-drift.lock.json):
+  - top-level fingerprint mismatch: the stored document does not hash to its own fingerprint (edited or corrupted after snapshotting)
+  - tool 'search_docs': entry fingerprint does not match its stored definition
+  - tool 'search_docs': field hash mismatch for 'description'
+(exit code 1)
 ```
 
 See [docs/USAGE.md](docs/USAGE.md) for the full flag reference and the
@@ -134,11 +155,13 @@ annotations-only change that 3-field pinners miss).
 
 ## Roadmap
 
-- **v0.2** — native Streamable HTTP probing; full 2026-07-28 stateless-era
+- **v0.3** — native Streamable HTTP probing; full 2026-07-28 stateless-era
   conformance checks (`server/discover` negotiation, era validation).
-- **v0.3** — multi-server configs in one run (snapshot/check every server
+- **v0.4** — multi-server configs in one run (snapshot/check every server
   in a client config); watch mode for local development.
 - Always: no runtime dependencies, no telemetry, lockfiles stay plain JSON.
+
+(Shipped in v0.2.0: lockfile self-verification — the `verify` command.)
 
 ## Maintainer & governance
 

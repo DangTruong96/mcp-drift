@@ -76,6 +76,24 @@ Human summary of a lockfile: server, identity, negotiated protocol, each
 pinned item with its short fingerprint and first description line, and
 all observations. `--json` prints the raw lockfile.
 
+### `verify [--lock PATH] [--json]`
+
+Offline integrity check of the lockfile itself — no server is probed.
+Recomputes the top-level fingerprint, every entry fingerprint and every
+per-field hash from the definitions stored next to them, and reports
+each mismatch: a definition edited without updating its hashes, a field
+hash that no longer matches, a stored hash for a field the definition
+does not have, a missing field hash, duplicate entries. Exit codes:
+0 = intact, 1 = edited or corrupted, 2 = lockfile missing/invalid.
+
+`check` and `diff` necessarily trust the stored fingerprints — they
+are the baseline — so run `verify` whenever a lockfile arrives from
+somewhere you did not just write it: a PR branch, a merge resolution,
+a vendored copy. Stated limit: a lockfile whose fingerprints were
+*all* recomputed after editing is indistinguishable from a fresh
+snapshot; catching that is what reviewing lockfile changes in pull
+requests is for — the same division of labour as `package-lock.json`.
+
 ## Lockfile format (version 1)
 
 ```json

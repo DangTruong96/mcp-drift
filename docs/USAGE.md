@@ -20,6 +20,10 @@ sorted keys so formatting changes don't create false drift.
 descriptor — transport + command + args + sorted env **keys**. Env
 *values* (secrets) are never written to the lockfile. Two entries with
 the same display name but different commands are different identities.
+Offline (`--tools-file`) snapshots use a location-independent identity
+(transport only): the same dump checked from a different directory or
+machine is the same source — the definitions themselves are what gets
+diffed, so committing the lockfile and checking it in CI works.
 
 ## Commands
 

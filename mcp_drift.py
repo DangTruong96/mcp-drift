@@ -28,7 +28,7 @@ import sys
 import threading
 from datetime import datetime, timezone
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 LOCK_FORMAT = "mcp-drift-lock"
 DEFAULT_LOCK = "mcp-drift.lock.json"
@@ -67,23 +67,43 @@ def fingerprint(obj):
 
 def tool_entry(tool):
     """One lockfile row for a tool: full definition + fingerprints."""
+    if not isinstance(tool, dict):
+        raise DriftError(
+            "definition entry is not a JSON object (got %s); servers "
+            "must serve tool/resource/prompt definitions as objects"
+            % type(tool).__name__)
+    name = tool.get("name", "")
+    if not isinstance(name, str):
+        raise DriftError(
+            "definition entry has a non-string name (%r); names must "
+            "be strings" % (name,))
     field_hashes = {}
     for field in TOOL_FIELDS:
         if field in tool:
             field_hashes[field] = fingerprint(tool[field])
     return {
-        "name": tool.get("name", ""),
+        "name": name,
         "fingerprint": fingerprint(tool),
         "fields": field_hashes,
         "definition": tool,
     }
 
 
-def entries_by_name(items):
+def entries_by_name(items, section="entries"):
     out = {}
     for item in items or []:
         entry = tool_entry(item)
-        out[entry["name"]] = entry
+        name = entry["name"]
+        if name in out:
+            # A lockfile keyed by name cannot pin two definitions that
+            # share one: the second would silently overwrite the first
+            # and changes to the shadowed definition could never be
+            # detected. Refuse, loudly, instead.
+            raise DriftError(
+                "duplicate name %r in %s: names must be unique to be "
+                "pinned (two definitions share the name; refusing to "
+                "pin only one of them)" % (name, section))
+        out[name] = entry
     return out
 
 
@@ -351,17 +371,30 @@ def parse_config_server(config_path, server_name):
         raise DriftError("server %r not in config (has: %s)"
                          % (server_name, ", ".join(sorted(servers))))
     entry = servers[server_name]
+    if not isinstance(entry, dict):
+        raise DriftError(
+            "server %r in config is not a JSON object (expected an "
+            "object with a 'command', e.g. {\"command\": \"python3\", "
+            "\"args\": [\"server.py\"]})" % server_name)
     cmd = entry.get("command")
     args = entry.get("args") or []
     if isinstance(cmd, dict):  # Zed shape: {"path": ..., "args": [...]}
         args = cmd.get("args") or args
         cmd = cmd.get("path") or cmd.get("command")
+    if not isinstance(args, list) or \
+            not all(isinstance(a, str) for a in args):
+        raise DriftError(
+            "server %r: 'args' must be a list of strings" % server_name)
     if not cmd or not isinstance(cmd, str):
         raise DriftError(
             "server %r has no stdio command (remote/HTTP servers are not "
             "supported by the live probe; use --tools-file instead)"
             % server_name)
     env = entry.get("env") or {}
+    if not isinstance(env, dict):
+        raise DriftError(
+            "server %r: 'env' must be an object of key/value pairs"
+            % server_name)
     return [cmd], list(args), dict(env), server_name
 
 
@@ -392,7 +425,7 @@ def load_tools_file(path):
 def build_snapshot(source, probe=None, tools=None, resources=None,
                    prompts=None, server_info=None, observations=None):
     """Assemble the lockfile document from probed or offline data."""
-    tools_map = entries_by_name(tools)
+    tools_map = entries_by_name(tools, "tools")
     snap = {
         "format": LOCK_FORMAT,
         "version": 1,
@@ -407,7 +440,7 @@ def build_snapshot(source, probe=None, tools=None, resources=None,
         snap["server"] = dict(source, serverInfo=server_info)
     for label, items in (("resources", resources), ("prompts", prompts)):
         if items is not None:
-            m = entries_by_name(items)
+            m = entries_by_name(items, label)
             snap[label] = [m[n] for n in sorted(m)]
     snap["fingerprint"] = _snapshot_fingerprint(snap)
     return snap
@@ -450,7 +483,13 @@ def snapshot_from_probe(command, args, env, env_keys, name, timeout,
 def snapshot_from_tools_file(path):
     tools, resources, prompts = load_tools_file(path)
     descriptor = {"transport": "tools-file", "path": os.path.abspath(path)}
-    descriptor["identity"] = fingerprint(descriptor)
+    # The identity deliberately excludes the path. A lockfile is meant
+    # to be committed and checked on other machines — CI checkouts live
+    # at different absolute paths — so the same dump at a different
+    # location must not read as a different server. The definitions
+    # themselves are diffed in full; the path adds no signal, only
+    # false drift. (The path stays in the descriptor for information.)
+    descriptor["identity"] = fingerprint({"transport": "tools-file"})
     return build_snapshot(descriptor, tools=tools, resources=resources,
                           prompts=prompts,
                           observations={"source": "offline tools dump"})

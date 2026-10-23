@@ -1,6 +1,7 @@
 """Tests for mcp_drift: unit + end-to-end against a fake MCP server."""
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -323,6 +324,119 @@ class TestVerifyCommand(unittest.TestCase):
         r = run_cli(["verify", "--lock", self.lock])
         self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
         self.assertIn("2 tools", r.stdout)
+
+
+class TestToolsFilePortability(unittest.TestCase):
+    """A committed tools-file lockfile must check clean on any machine.
+
+    Regression: the offline identity used to be a fingerprint of the
+    dump's ABSOLUTE path, so the identical lockfile + dump copied to
+    another directory (i.e. every CI checkout) reported
+    'server identity changed' and exited 1.
+    """
+
+    TOOLS = [{"name": "a", "description": "one", "inputSchema": {}}]
+
+    def test_same_content_same_identity_at_any_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            snaps = []
+            for sub in ("one", "two"):
+                d = os.path.join(td, sub)
+                os.makedirs(d)
+                p = os.path.join(d, "dump.json")
+                with open(p, "w") as fh:
+                    json.dump({"tools": self.TOOLS}, fh)
+                snaps.append(md.snapshot_from_tools_file(p))
+            self.assertEqual(snaps[0]["server"]["identity"],
+                             snaps[1]["server"]["identity"])
+            self.assertFalse(md.diff_snapshots(*snaps)["drift"])
+
+    def test_cli_check_clean_from_another_directory(self):
+        with tempfile.TemporaryDirectory() as td:
+            dir_a = os.path.join(td, "author-machine", "repo")
+            dir_b = os.path.join(td, "ci-runner", "checkout")
+            for d in (dir_a, dir_b):
+                os.makedirs(d)
+                with open(os.path.join(d, "tools.json"), "w") as fh:
+                    json.dump({"tools": self.TOOLS}, fh)
+            lock = os.path.join(dir_a, "lock.json")
+            r = run_cli(["snapshot", "--tools-file",
+                         os.path.join(dir_a, "tools.json"), "-o", lock])
+            self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+            shutil.copy(lock, os.path.join(dir_b, "lock.json"))
+            r = run_cli(["check", "--tools-file", "tools.json",
+                         "--lock", "lock.json"], cwd=dir_b)
+            self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+            self.assertIn("No drift", r.stdout)
+
+
+class TestMalformedInputs(unittest.TestCase):
+    """Malformed sources: clean exit-2 errors, never tracebacks, and
+    never a silently lossy snapshot."""
+
+    def write(self, obj, raw=None):
+        fh = tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False)
+        if raw is not None:
+            fh.write(raw)
+        else:
+            json.dump(obj, fh)
+        fh.close()
+        return fh.name
+
+    def test_duplicate_tool_names_rejected(self):
+        # Regression: duplicates used to collapse silently into one
+        # pinned entry ("tools pinned: 1" for two definitions), and
+        # changes to the shadowed definition could never be detected.
+        tools = [
+            {"name": "dup", "description": "first", "inputSchema": {}},
+            {"name": "dup", "description": "second", "inputSchema": {}},
+        ]
+        with self.assertRaises(md.DriftError):
+            md.build_snapshot({"transport": "test"}, tools=tools)
+        path = self.write({"tools": tools})
+        out = path + ".lock"
+        r = run_cli(["snapshot", "--tools-file", path, "-o", out])
+        self.assertEqual(r.returncode, 2, r.stderr + r.stdout)
+        self.assertIn("duplicate name", r.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_non_object_entries_rejected(self):
+        # Regression: these used to die with an AttributeError /
+        # TypeError traceback and exit code 1 (the "drift" code).
+        for raw in ('["just-a-string"]', '[42]'):
+            path = self.write(None, raw=raw)
+            r = run_cli(["snapshot", "--tools-file", path,
+                         "-o", path + ".lock"])
+            self.assertEqual(r.returncode, 2, r.stderr + r.stdout)
+            self.assertNotIn("Traceback", r.stderr)
+
+    def test_non_string_name_rejected(self):
+        path = self.write({"tools": [{"name": 123, "description": "x"}]})
+        r = run_cli(["snapshot", "--tools-file", path,
+                     "-o", path + ".lock"])
+        self.assertEqual(r.returncode, 2, r.stderr + r.stdout)
+        self.assertIn("non-string name", r.stderr)
+
+    def test_config_entry_not_an_object(self):
+        path = self.write({"mcpServers": {"x": "https://example.com"}})
+        with self.assertRaises(md.DriftError):
+            md.parse_config_server(path, "x")
+
+    def test_config_args_must_be_a_list_of_strings(self):
+        # A string 'args' used to be split into single characters and
+        # launched as a garbage command that then "timed out".
+        for args in ("srv.py", [123]):
+            path = self.write({"mcpServers": {"x": {
+                "command": "python3", "args": args}}})
+            with self.assertRaises(md.DriftError):
+                md.parse_config_server(path, "x")
+
+    def test_config_env_must_be_an_object(self):
+        path = self.write({"mcpServers": {"x": {
+            "command": "python3", "args": [], "env": ["A=1"]}}})
+        with self.assertRaises(md.DriftError):
+            md.parse_config_server(path, "x")
 
 
 if __name__ == "__main__":

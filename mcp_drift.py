@@ -28,7 +28,7 @@ import sys
 import threading
 from datetime import datetime, timezone
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 LOCK_FORMAT = "mcp-drift-lock"
 DEFAULT_LOCK = "mcp-drift.lock.json"
@@ -350,6 +350,8 @@ def parse_config_server(config_path, server_name):
         raise DriftError("cannot read config: %s" % exc)
     except ValueError as exc:
         raise DriftError("config is not valid JSON: %s" % exc)
+    except RecursionError:
+        raise DriftError("config JSON is nested too deeply to process")
     servers = None
     for key in ("mcpServers", "servers", "context_servers"):
         if isinstance(data, dict) and isinstance(data.get(key), dict):
@@ -407,6 +409,8 @@ def load_tools_file(path):
         raise DriftError("cannot read tools file: %s" % exc)
     except ValueError as exc:
         raise DriftError("tools file is not valid JSON: %s" % exc)
+    except RecursionError:
+        raise DriftError("tools file JSON is nested too deeply to process")
     if isinstance(data, list):
         return data, None, None
     if isinstance(data, dict):
@@ -446,13 +450,35 @@ def build_snapshot(source, probe=None, tools=None, resources=None,
     return snap
 
 
+def _entry_sort_key(entry):
+    if isinstance(entry, dict):
+        name = entry.get("name")
+        if isinstance(name, str):
+            return name
+    return ""
+
+
 def _snapshot_fingerprint(snap):
     """Top-level fingerprint of a snapshot document: everything except
     the volatile `created_at`/`tool` fields and the fingerprint itself.
     Shared by snapshot building and `verify_lockfile` so the two can
-    never drift apart."""
-    core = {k: snap[k] for k in snap
-            if k not in ("created_at", "tool", "fingerprint")}
+    never drift apart.
+
+    Entry order inside a section carries no meaning anywhere else in
+    the tool (diffing is keyed by name), so sections are hashed with
+    their entries sorted by name: merely reordering a lockfile's
+    entries (a JSON formatter, a merge tool) must not make `verify`
+    reject an otherwise intact document. Snapshots this tool writes
+    are already name-sorted, so existing lockfiles hash identically.
+    """
+    core = {}
+    for key, value in snap.items():
+        if key in ("created_at", "tool", "fingerprint"):
+            continue
+        if key in ("tools", "resources", "prompts") \
+                and isinstance(value, list):
+            value = sorted(value, key=_entry_sort_key)
+        core[key] = value
     return fingerprint(core)
 
 
@@ -510,6 +536,8 @@ def load_snapshot(path):
                          % path)
     except ValueError as exc:
         raise DriftError("lockfile is not valid JSON: %s" % exc)
+    except RecursionError:
+        raise DriftError("lockfile JSON is nested too deeply to process")
     if not isinstance(data, dict) or data.get("format") != LOCK_FORMAT:
         raise DriftError("%s is not an mcp-drift lockfile" % path)
     return data
@@ -519,8 +547,32 @@ def load_snapshot(path):
 # Diffing
 # --------------------------------------------------------------------------
 
+def _section_entries(snap, section):
+    """Entries of one lockfile section, structurally validated.
+
+    Diffing and display key entries by name and trust their stored
+    fingerprints; a hand-mangled entry (not an object, no name, no
+    fingerprint) must surface as a clean tool error here instead of
+    a KeyError / TypeError traceback deep inside the diff.
+    """
+    entries = snap.get(section) or []
+    if not isinstance(entries, list):
+        raise DriftError(
+            "lockfile section %r is not a list of entries "
+            "(run `verify` to diagnose the lockfile)" % section)
+    for entry in entries:
+        if not isinstance(entry, dict) \
+                or not isinstance(entry.get("name"), str) \
+                or "fingerprint" not in entry:
+            raise DriftError(
+                "malformed entry in lockfile section %r: every entry "
+                "must be an object with a 'name' and a 'fingerprint' "
+                "(run `verify` to diagnose the lockfile)" % section)
+    return entries
+
+
 def _entry_map(snap, section):
-    return {e["name"]: e for e in snap.get(section) or []}
+    return {e["name"]: e for e in _section_entries(snap, section)}
 
 
 def diff_section(old_snap, new_snap, section):
@@ -646,8 +698,18 @@ def verify_lockfile(snap):
         entries = snap.get(section)
         if entries is None:
             continue
+        if not isinstance(entries, list):
+            problems.append(
+                "%s: section is not a list of entries" % section)
+            continue
         seen = set()
-        for entry in entries:
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                problems.append(
+                    "%s entry #%d: not an object (got %s); the entry "
+                    "cannot be checked"
+                    % (section, index, type(entry).__name__))
+                continue
             name = entry.get("name", "?")
             label = "%s %r" % (section[:-1], name)
             if name in seen:
@@ -804,9 +866,9 @@ def cmd_show(args):
     if srv.get("negotiated_protocol"):
         print("  negotiated protocol: %s" % srv["negotiated_protocol"])
     for section in ("tools", "resources", "prompts"):
-        entries = snap.get(section)
-        if entries is None:
+        if snap.get(section) is None:
             continue
+        entries = _section_entries(snap, section)
         print("%s (%d):" % (section.capitalize(), len(entries)))
         for e in entries:
             desc = (e.get("definition", {}).get("description") or "")
@@ -886,6 +948,14 @@ def main(argv=None):
         return args.func(args)
     except DriftError as exc:
         print("error: %s" % exc, file=sys.stderr)
+        return 2
+    except RecursionError:
+        # Valid-but-extreme JSON (a tools dump nested thousands of
+        # levels deep) can exceed the interpreter's recursion budget
+        # in the canonicaliser even when it parsed. That is a tool
+        # error (exit 2), never a traceback.
+        print("error: input is nested too deeply to process",
+              file=sys.stderr)
         return 2
 
 

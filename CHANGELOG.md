@@ -4,6 +4,35 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.2] — 2026-10-23
+
+### Fixed
+- **Deeply nested input no longer crashes with a traceback.** A
+  tools dump or lockfile nested ~1,500+ levels deep (a pathological
+  `inputSchema`) hit Python's recursion limit inside json
+  encoding/decoding and died with an uncaught `RecursionError`,
+  exit 1 — the *drift* exit code. Such input is now a clean error,
+  exit 2: "nested too deeply to process".
+- **Structurally mangled lockfile entries are diagnosed, not
+  crashed on.** An entry that is not a JSON object, or one missing
+  its stored `fingerprint`, made `verify` die with
+  `AttributeError`, `check` with `TypeError`, and `diff` with
+  `KeyError` — all raw tracebacks with exit 1. `verify` (whose job
+  is diagnosing corrupt lockfiles) now lists non-object entries as
+  problems and exits 1; `diff` / `check` / `show` refuse with a
+  clean "malformed entry" error, exit 2.
+- **`verify` no longer rejects a lockfile whose entries were
+  merely reordered.** The top-level fingerprint hashed the entries
+  in file order, while every other code path (`diff`, `check`)
+  treats sections as name-keyed maps — so running a formatter or
+  merge tool over a lockfile failed `verify` even though `check`
+  reported no drift. The fingerprint is now computed over entries
+  sorted by name. Snapshots have always been written sorted, so
+  lockfiles produced by any released version verify exactly as
+  before; only hand-reordered files change verdict (from fail to
+  pass).
+- 6 regression tests — 43 tests total.
+
 ## [0.2.1] — 2026-10-23
 
 ### Fixed

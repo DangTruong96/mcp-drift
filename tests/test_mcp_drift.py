@@ -441,3 +441,115 @@ class TestMalformedInputs(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAdversarialRound2(unittest.TestCase):
+    """Round-2 adversarial pass: hostile nesting, structurally mangled
+    lockfiles, and entry-order insensitivity of `verify`."""
+
+    def write(self, obj, raw=None):
+        fh = tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False)
+        if raw is not None:
+            fh.write(raw)
+        else:
+            json.dump(obj, fh)
+        fh.close()
+        return fh.name
+
+    def snap(self, tools):
+        return md.build_snapshot({"transport": "test"}, tools=tools)
+
+    def test_deeply_nested_tools_file_is_clean_error(self):
+        # Regression: a tools dump nested thousands of levels deep
+        # used to die with an uncaught RecursionError traceback and
+        # exit 1. Built as raw text: json.dump cannot even write it.
+        depth = 3000
+        body = ('{"type": "object", "properties": {"n": ' * depth
+                + '{"type": "string"}' + '}}' * depth)
+        raw = ('{"tools": [{"name": "deep", "description": "d", '
+               '"inputSchema": ' + body + '}]}')
+        path = self.write(None, raw=raw)
+        r = run_cli(["snapshot", "--tools-file", path,
+                     "-o", path + ".lock"])
+        self.assertEqual(r.returncode, 2, r.stderr + r.stdout)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("nested too deeply", r.stderr)
+
+    def test_deeply_nested_lockfile_is_clean_error(self):
+        depth = 20000
+        body = ('{"type": "object", "properties": {"n": ' * depth
+                + '{"type": "string"}' + '}}' * depth)
+        raw = ('{"format": "mcp-drift-lock", "tools": [{"name": "x", '
+               '"fingerprint": "0", "fields": {}, "definition": '
+               '{"name": "x", "inputSchema": ' + body + '}}]}')
+        path = self.write(None, raw=raw)
+        r = run_cli(["verify", "--lock", path])
+        self.assertEqual(r.returncode, 2, r.stderr + r.stdout)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_verify_reports_non_object_entry(self):
+        # Regression: verify — the command whose whole job is
+        # diagnosing corrupt lockfiles — crashed with AttributeError
+        # on a lockfile whose entry was a bare string.
+        snap = self.snap([{"name": "a", "description": "one",
+                           "inputSchema": {}}])
+        snap["tools"].append("just-a-string")
+        problems = md.verify_lockfile(snap)
+        self.assertTrue(any("not an object" in p for p in problems),
+                        problems)
+        path = self.write(snap)
+        r = run_cli(["verify", "--lock", path])
+        self.assertEqual(r.returncode, 1, r.stderr + r.stdout)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("not an object", r.stdout)
+
+    def test_malformed_entry_clean_error_in_diff_check_show(self):
+        # Regression: check/diff/show died with TypeError/KeyError
+        # tracebacks (exit 1) on entries that are not objects or lack
+        # a stored fingerprint.
+        good = self.snap([{"name": "a", "description": "one",
+                           "inputSchema": {}}])
+        string_entry = json.loads(json.dumps(good))
+        string_entry["tools"][0] = "just-a-string"
+        no_fp = json.loads(json.dumps(good))
+        del no_fp["tools"][0]["fingerprint"]
+        for mangled in (string_entry, no_fp):
+            bad_path = self.write(mangled)
+            good_path = self.write(good)
+            for argv in (["diff", bad_path, good_path],
+                         ["show", "--lock", bad_path]):
+                r = run_cli(argv)
+                self.assertEqual(r.returncode, 2, r.stderr + r.stdout)
+                self.assertNotIn("Traceback", r.stderr)
+                self.assertIn("malformed entry", r.stderr)
+
+    def test_verify_ignores_entry_order(self):
+        # Regression: the top-level fingerprint was the only
+        # order-sensitive value in the tool, so a lockfile whose
+        # entries were merely reordered (formatter, merge tool)
+        # failed `verify` while `check` reported no drift.
+        tools = [{"name": n, "description": "d " + n, "inputSchema": {}}
+                 for n in ("alpha", "beta", "gamma", "delta")]
+        snap = self.snap(tools)
+        reordered = json.loads(json.dumps(snap))
+        reordered["tools"] = list(reversed(reordered["tools"]))
+        self.assertEqual(md.verify_lockfile(reordered), [])
+        path = self.write(reordered)
+        r = run_cli(["verify", "--lock", path])
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+
+    def test_verify_still_catches_reorder_plus_tamper(self):
+        tools = [{"name": n, "description": "d " + n, "inputSchema": {}}
+                 for n in ("alpha", "beta")]
+        snap = self.snap(tools)
+        evil = json.loads(json.dumps(snap))
+        evil["tools"] = list(reversed(evil["tools"]))
+        evil["tools"][0]["definition"]["description"] = "pwned"
+        problems = md.verify_lockfile(evil)
+        self.assertTrue(any("fingerprint" in p for p in problems),
+                        problems)
+
+
+if __name__ == "__main__":
+    unittest.main()

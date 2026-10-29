@@ -4,6 +4,29 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.3] — 2026-10-29
+
+### Fixed
+- **Malformed lockfile entries no longer crash with a traceback.**
+  An entry whose `definition` is not an object (a string, a list, …)
+  made `show` die with `AttributeError`, and made `diff`/`check` die
+  the same way once both the entry fingerprint and a field hash
+  differed so the field lookup ran. An entry whose `fields` is not
+  an object made `verify` — the command whose job is diagnosing
+  corrupt lockfiles — die with `AttributeError`. `diff`/`check`/
+  `show` now refuse such entries with a clean "malformed entry"
+  error, exit 2; `verify` now lists them as problems, exit 1.
+- **Duplicate entries in a lockfile no longer collapse silently in
+  `diff`/`check`/`show`.** Two entries sharing a name used to be
+  keyed into one map entry (the last won), so when the shadowed
+  first entry differed and the good copy came last, `diff` reported
+  "No drift" while `verify` flagged the duplicate — the same
+  collapse fixed for snapshot sources in v0.2.1. `diff`/`check`/
+  `show` now refuse a duplicated name with a clean error, exit 2.
+  (Snapshots never write duplicates, so no valid lockfile changes
+  verdict.)
+- 2 regression tests — 45 tests total.
+
 ## [0.2.2] — 2026-10-23
 
 ### Fixed

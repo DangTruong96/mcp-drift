@@ -524,6 +524,73 @@ class TestAdversarialRound2(unittest.TestCase):
                 self.assertNotIn("Traceback", r.stderr)
                 self.assertIn("malformed entry", r.stderr)
 
+    def test_malformed_definition_fields_clean_error(self):
+        # Regression (QA loop 2026-10-29, mcp-drift): a lockfile entry
+        # whose 'definition' is a string/list crashed show with an
+        # AttributeError traceback, crashed diff the same way once
+        # both the entry fingerprint and a field hash differed, and
+        # an entry whose 'fields' is a string/list crashed verify —
+        # the command whose whole job is diagnosing corrupt
+        # lockfiles — with an AttributeError traceback. All three
+        # must now be clean errors / clean problem reports.
+        good = self.snap([{"name": "a", "description": "one",
+                           "inputSchema": {}}])
+        def_string = json.loads(json.dumps(good))
+        def_string["tools"][0]["definition"] = "not-an-object"
+        def_string["tools"][0]["fingerprint"] = "0" * 64
+        def_string["tools"][0]["fields"]["description"] = "0" * 64
+        fields_string = json.loads(json.dumps(good))
+        fields_string["tools"][0]["fields"] = "bogus"
+        fields_list = json.loads(json.dumps(good))
+        fields_list["tools"][0]["fields"] = ["description"]
+        for mangled in (def_string, fields_string, fields_list):
+            bad_path = self.write(mangled)
+            good_path = self.write(good)
+            for argv in (["diff", bad_path, good_path],
+                         ["show", "--lock", bad_path]):
+                r = run_cli(argv)
+                self.assertEqual(r.returncode, 2, r.stderr + r.stdout)
+                self.assertNotIn("Traceback", r.stderr)
+                self.assertIn("malformed entry", r.stderr)
+            r = run_cli(["verify", "--lock", bad_path])
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertIn("not an object", r.stdout)
+        # verify on a fields-mangled lockfile exits 1 (corrupt
+        # baseline), not 2: the lockfile parses, its content is bad.
+        r = run_cli(["verify", "--lock", self.write(fields_string)])
+        self.assertEqual(r.returncode, 1, r.stderr + r.stdout)
+
+    def test_duplicate_lockfile_entry_refused_by_diff_check_show(self):
+        # Regression (QA loop 2026-10-29, mcp-drift): a lockfile with
+        # two entries for one name silently kept only the last, so
+        # when the shadowed (first) entry differed and the good copy
+        # came last, diff reported "No drift" while verify flagged
+        # the duplicate — the same collapse fixed for snapshot
+        # sources in v0.2.1. diff/check/show must now refuse the
+        # ambiguous baseline with a clean exit-2 error.
+        good = self.snap([{"name": "a", "description": "one",
+                           "inputSchema": {}}])
+        dup = json.loads(json.dumps(good))
+        bad = dict(dup["tools"][0])
+        bad["fingerprint"] = "0" * 64
+        dup["tools"] = [bad, dup["tools"][0]]
+        # Sanity: verify still flags it, and the old diff behaviour
+        # (before this fix) reported no drift for this exact file.
+        self.assertTrue(any("duplicate entry" in p
+                            for p in md.verify_lockfile(dup)))
+        bad_path = self.write(dup)
+        good_path = self.write(good)
+        dump_path = self.write({"tools": [
+            {"name": "a", "description": "one", "inputSchema": {}}]})
+        for argv in (["diff", bad_path, good_path],
+                     ["show", "--lock", bad_path],
+                     ["check", "--tools-file", dump_path,
+                      "--lock", bad_path]):
+            r = run_cli(argv)
+            self.assertEqual(r.returncode, 2, r.stderr + r.stdout)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertIn("duplicate entry", r.stderr)
+
     def test_verify_ignores_entry_order(self):
         # Regression: the top-level fingerprint was the only
         # order-sensitive value in the tool, so a lockfile whose

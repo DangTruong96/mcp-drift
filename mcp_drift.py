@@ -28,7 +28,7 @@ import sys
 import threading
 from datetime import datetime, timezone
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 LOCK_FORMAT = "mcp-drift-lock"
 DEFAULT_LOCK = "mcp-drift.lock.json"
@@ -560,6 +560,7 @@ def _section_entries(snap, section):
         raise DriftError(
             "lockfile section %r is not a list of entries "
             "(run `verify` to diagnose the lockfile)" % section)
+    seen = set()
     for entry in entries:
         if not isinstance(entry, dict) \
                 or not isinstance(entry.get("name"), str) \
@@ -568,6 +569,35 @@ def _section_entries(snap, section):
                 "malformed entry in lockfile section %r: every entry "
                 "must be an object with a 'name' and a 'fingerprint' "
                 "(run `verify` to diagnose the lockfile)" % section)
+        if entry["name"] in seen:
+            # Keyed by name, a section cannot pin two definitions that
+            # share one: the map below would silently keep only the
+            # last, and changes to the shadowed entry could never be
+            # detected — the same collapse fixed for snapshot sources
+            # in v0.2.1. Refuse the ambiguous baseline instead.
+            raise DriftError(
+                "duplicate entry %r in lockfile section %r: names "
+                "must be unique to be pinned "
+                "(run `verify` to diagnose the lockfile)"
+                % (entry["name"], section))
+        seen.add(entry["name"])
+        # show/diff read entry["definition"] and entry["fields"] as
+        # dicts; a hand-edited or merge-damaged entry of another type
+        # used to crash them (and verify) with an AttributeError
+        # traceback. Refuse it here, like every other malformed entry.
+        if "definition" in entry \
+                and not isinstance(entry["definition"], dict):
+            raise DriftError(
+                "malformed entry %r in lockfile section %r: "
+                "'definition' must be an object "
+                "(run `verify` to diagnose the lockfile)"
+                % (entry["name"], section))
+        if "fields" in entry and not isinstance(entry["fields"], dict):
+            raise DriftError(
+                "malformed entry %r in lockfile section %r: "
+                "'fields' must be an object "
+                "(run `verify` to diagnose the lockfile)"
+                % (entry["name"], section))
     return entries
 
 
@@ -717,14 +747,28 @@ def verify_lockfile(snap):
                                 % label)
             seen.add(name)
             definition = entry.get("definition")
-            if not isinstance(definition, dict):
+            if definition is None:
                 problems.append("%s: missing stored definition" % label)
+                continue
+            if not isinstance(definition, dict):
+                problems.append(
+                    "%s: stored definition is not an object (got %s); "
+                    "the entry cannot be checked"
+                    % (label, type(definition).__name__))
                 continue
             if entry.get("fingerprint") != fingerprint(definition):
                 problems.append(
                     "%s: entry fingerprint does not match its stored "
                     "definition" % label)
-            stored_fields = entry.get("fields") or {}
+            stored_fields = entry.get("fields")
+            if stored_fields is not None \
+                    and not isinstance(stored_fields, dict):
+                problems.append(
+                    "%s: 'fields' is not an object (got %s); the "
+                    "entry cannot be checked"
+                    % (label, type(stored_fields).__name__))
+                continue
+            stored_fields = stored_fields or {}
             for field, stored_hash in stored_fields.items():
                 if field not in definition:
                     problems.append(

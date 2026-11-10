@@ -4,6 +4,47 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.4] — 2026-11-10
+
+### Fixed
+- **Definitions containing lone surrogates no longer crash with a
+  traceback.** A tool description carrying a JSON-legal lone-surrogate
+  escape (`\ud800` — servable by any MCP server over stdio, or present
+  in a tools dump) made `snapshot`, `check`, `verify` and `show` die
+  with an uncaught `UnicodeEncodeError`, exit 1, because the canonical
+  fingerprint encoded text as strict UTF-8 and the lockfile writer
+  wrote raw UTF-8. Fingerprints now encode with `surrogatepass`
+  (deterministic and injective: valid UTF-8 never contains the
+  `ED A0..BF` lead bytes, so no real character can collide with a
+  surrogate's encoding, and the fix deliberately does *not* sanitize
+  surrogates to U+FFFD — that would make two different served
+  definitions pin identically). Lockfiles are written with
+  `ensure_ascii=True`, which round-trips through `json.load`
+  identically, and stdout/stderr render unencodable characters as
+  `\ud800` escapes instead of raising mid-report. Fingerprints of all
+  surrogate-free values are unchanged, so lockfiles written by any
+  earlier release keep verifying exactly as before.
+- **A server that paginates forever no longer hangs `snapshot` /
+  `check`.** `_list_all` followed `nextCursor` without any bound, so
+  a server returning a fresh cursor on every page (48,726 pages
+  fetched in 20 s in the repro) looped forever — the per-request
+  timeout never fires because each page answers instantly. Listing
+  now refuses cleanly after 100 pages, exit 2.
+- **Unmatched server messages no longer accumulate unboundedly.**
+  `_wait_for` appended every notification (and every response to
+  another id) to a `pending` list that nothing ever read, so a
+  server flooding 100k notifications before answering grew the tool
+  to ~111 MB peak RSS (now ~21 MB). Unmatched messages are dropped
+  as they arrive.
+- 7 regression tests — 52 tests total. Scale spot-checks (same run):
+  20,000-tool dump snapshots in ~3.4 s, verifies in ~1.8 s, checks
+  in ~2.2 s (2,000 tools: 0.6 s / 0.2 s / 0.3 s — linear, no
+  quadratic blowup); a 100 MB single-description dump snapshots and
+  verifies cleanly; deeply nested input (1,000+ levels) is still a
+  clean exit-2 "nested too deeply" error; reordering lockfile
+  entries, re-keying definitions, and re-snapshotting the same dump
+  all still verify / report no drift.
+
 ## [0.2.3] — 2026-10-29
 
 ### Fixed

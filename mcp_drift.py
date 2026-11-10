@@ -28,7 +28,7 @@ import sys
 import threading
 from datetime import datetime, timezone
 
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 
 LOCK_FORMAT = "mcp-drift-lock"
 DEFAULT_LOCK = "mcp-drift.lock.json"
@@ -57,7 +57,17 @@ def canonical(obj):
 
 
 def sha(text):
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    # surrogatepass: JSON permits lone-surrogate escapes (\ud800),
+    # which Python's json decodes into lone-surrogate str. Plain
+    # UTF-8 encoding raises on those, so fingerprinting a definition
+    # served by a hostile (or buggy) server used to crash the whole
+    # run with an uncaught UnicodeEncodeError. surrogatepass encodes
+    # each surrogate in its 3-byte CESU-8 form — deterministic, and
+    # injective here because valid UTF-8 never contains the ED A0..BF
+    # lead bytes, so no real character can collide with a surrogate's
+    # encoding. Fingerprints of all surrogate-free values are
+    # unchanged, so existing lockfiles keep verifying.
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def fingerprint(obj):
@@ -149,7 +159,6 @@ class StdioMCPClient:
         """Read messages until the response for want_id arrives."""
         import time
         deadline = time.time() + self.timeout
-        pending = []
         while time.time() < deadline:
             try:
                 msg = self._q.get(timeout=max(0.1, deadline - time.time()))
@@ -161,7 +170,11 @@ class StdioMCPClient:
                     "transport): %r" % msg["_stdout_contamination"][:120])
             if msg.get("id") == want_id and ("result" in msg or "error" in msg):
                 return msg
-            pending.append(msg)
+            # Any other message (a notification, or a response to an
+            # id we are not waiting for) is dropped on the floor: it
+            # is never needed again, and retaining it would let a
+            # chatty server grow this process's memory without bound
+            # while one request waits.
         raise DriftError("timed out waiting for response id %s" % want_id)
 
     def request(self, method, params=None):
@@ -209,6 +222,13 @@ class _RpcError(DriftError):
 
 METHOD_NOT_FOUND = -32601
 
+# A server that keeps returning nextCursor (buggy, or hostile) would
+# otherwise make snapshot/check loop forever: each page answers
+# instantly, so the per-request timeout never fires. 100 pages is far
+# beyond any real server's listing (a page is typically tens of tools);
+# past it, refuse the unbounded listing instead of hanging.
+MAX_LIST_PAGES = 100
+
 
 # --------------------------------------------------------------------------
 # Probing
@@ -217,6 +237,7 @@ METHOD_NOT_FOUND = -32601
 def _list_all(client, method, key):
     """Follow pagination cursors for a list method."""
     items, cursor = [], None
+    pages = 0
     while True:
         params = {}
         if cursor:
@@ -224,8 +245,14 @@ def _list_all(client, method, key):
         result = client.request(method, params) or {}
         items.extend(result.get(key, []) or [])
         cursor = result.get("nextCursor")
+        pages += 1
         if not cursor:
             return items
+        if pages >= MAX_LIST_PAGES:
+            raise DriftError(
+                "server kept paginating %s past %d pages; refusing to "
+                "snapshot an unbounded listing (possible pagination "
+                "loop)" % (method, MAX_LIST_PAGES))
 
 
 def initialize_session(command, args, env, cwd, timeout, protocol):
@@ -522,8 +549,13 @@ def snapshot_from_tools_file(path):
 
 
 def write_snapshot(snap, out_path):
+    # ensure_ascii=True: a definition may contain lone surrogates
+    # (JSON-legal \ud800 escapes served by a hostile server); writing
+    # them raw to a UTF-8 file raises UnicodeEncodeError. The escaped
+    # form round-trips through json.load to the identical string, so
+    # stored fingerprints are unaffected.
     with open(out_path, "w", encoding="utf-8") as fh:
-        json.dump(snap, fh, indent=2, ensure_ascii=False)
+        json.dump(snap, fh, indent=2, ensure_ascii=True)
         fh.write("\n")
 
 
@@ -984,6 +1016,15 @@ def build_parser():
 
 
 def main(argv=None):
+    # Definitions may contain lone surrogates, and printing one to a
+    # strict UTF-8 stdout/stderr raises mid-report. Render them as
+    # \ud800 escapes instead of crashing (JSON output stays valid:
+    # \ud800 is a legal JSON string escape).
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except Exception:
+            pass
     args = build_parser().parse_args(argv)
     # argparse.REMAINDER keeps a leading "--"; drop it.
     if getattr(args, "cmd", None) and args.cmd and args.cmd[0] == "--":

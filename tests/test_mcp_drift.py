@@ -813,65 +813,66 @@ class TestQaRound3ScaleFuzz(unittest.TestCase):
             self.assertNotIn("Traceback", r.stderr)
             self.assertIn("past 100 pages", r.stderr)
 
-    def test_notification_flood_memory_bounded(self):
+    def test_unmatched_messages_are_dropped_not_retained(self):
         # Regression: every unmatched message (notification, or a
         # response to another id) was appended to a dead `pending`
         # list that nothing ever read, so a server flooding 100k
         # notifications before answering grew the tool to ~111 MB
-        # peak RSS. Unmatched messages are now dropped; peak RSS
-        # must stay near the ~18 MB baseline.
+        # peak RSS. Unmatched messages must now be dropped as they
+        # arrive. Measured deterministically in-process: a feeder
+        # thread trickles 2,000 notifications into the client's queue
+        # while _wait_for runs, and a sampler thread records live
+        # traced memory — on the old code the dead list grows to
+        # ~1 MB, on the fixed code it stays ~12 KB. (An earlier
+        # version of this test asserted CLI peak RSS instead; that
+        # proved scheduling-dependent — the reader thread can run
+        # ahead of the consumer and swell the queue itself — and
+        # failed on the CI runner at 82 MB while the same flood
+        # peaked at 21 MB locally.)
+        import queue
+        import threading
         import time
-        server = (
-            "import json, sys, os\n"
-            "N = int(os.environ.get('FLOOD_N', '100000'))\n"
-            "for line in sys.stdin:\n"
-            "    try: msg = json.loads(line)\n"
-            "    except ValueError: continue\n"
-            "    m, mid = msg.get('method'), msg.get('id')\n"
-            "    if m == 'initialize':\n"
-            "        for i in range(N):\n"
-            "            sys.stdout.write(json.dumps({'jsonrpc': '2.0', "
-            "'method': 'notifications/message', 'params': "
-            "{'level': 'info', 'data': 'flood-%d-%s' % (i, 'x'*120)}}) "
-            "+ chr(10))\n"
-            "        sys.stdout.flush()\n"
-            "        r = {'jsonrpc': '2.0', 'id': mid, 'result': "
-            "{'protocolVersion': '2025-06-18', 'capabilities': "
-            "{'tools': {}}, 'serverInfo': {'name': 'flood', "
-            "'version': '1'}}}\n"
-            "    elif m == 'tools/list':\n"
-            "        r = {'jsonrpc': '2.0', 'id': mid, 'result': "
-            "{'tools': []}}\n"
-            "    elif mid is not None:\n"
-            "        r = {'jsonrpc': '2.0', 'id': mid, 'error': "
-            "{'code': -32601, 'message': 'nf'}}\n"
-            "    else: continue\n"
-            "    sys.stdout.write(json.dumps(r) + chr(10))\n"
-            "    sys.stdout.flush()\n")
-        with tempfile.TemporaryDirectory() as td:
-            env = dict(os.environ, FLOOD_N="100000")
-            proc = subprocess.Popen(
-                CLI + ["--timeout", "30", "snapshot", "-o",
-                       os.path.join(td, "lock.json"), "--",
-                       sys.executable, "-c", server],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, env=env)
-            peak_kb = 0
-            while proc.poll() is None:
-                try:
-                    with open("/proc/%d/status" % proc.pid) as fh:
-                        for ln in fh:
-                            if ln.startswith("VmHWM:"):
-                                peak_kb = max(peak_kb,
-                                              int(ln.split()[1]))
-                except OSError:
-                    pass
-                time.sleep(0.05)
-            out, err = proc.communicate(timeout=120)
-            self.assertEqual(proc.returncode, 0, err + out)
-            self.assertLess(peak_kb, 60 * 1024,
-                            "peak RSS %d KB for a 100k-notification "
-                            "flood" % peak_kb)
+        import tracemalloc
+        client = md.StdioMCPClient.__new__(md.StdioMCPClient)
+        client.timeout = 60
+        client._q = queue.Queue()
+        peak = [0]
+        stop = threading.Event()
+
+        def sampler():
+            while not stop.is_set():
+                cur, _ = tracemalloc.get_traced_memory()
+                peak[0] = max(peak[0], cur)
+                time.sleep(0.005)
+
+        def feed():
+            for i in range(2000):
+                client._q.put(
+                    {"jsonrpc": "2.0",
+                     "method": "notifications/message",
+                     "params": {"level": "info",
+                                "data": "flood-%d-%s" % (i, "x" * 120)}})
+                time.sleep(0.002)
+            client._q.put({"jsonrpc": "2.0", "id": 1,
+                           "result": {"ok": True}})
+
+        tracemalloc.start()
+        sampler_thread = threading.Thread(target=sampler)
+        sampler_thread.start()
+        feeder = threading.Thread(target=feed)
+        feeder.start()
+        try:
+            msg = client._wait_for(1)
+        finally:
+            feeder.join()
+            stop.set()
+            sampler_thread.join()
+            tracemalloc.stop()
+        self.assertEqual(msg.get("result"), {"ok": True})
+        self.assertLess(peak[0], 200 * 1024,
+                        "live traced memory peaked at %d bytes while "
+                        "waiting through 2,000 unmatched messages"
+                        % peak[0])
 
 
 if __name__ == "__main__":
